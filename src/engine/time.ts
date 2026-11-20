@@ -30,13 +30,6 @@ export function formatMinutes(totalMinutes: number | null): string {
   return dayOffset > 0 ? `${hhmm} (+${dayOffset}d)` : hhmm;
 }
 
-export function formatMinutesPlain(totalMinutes: number): string {
-  const rounded = Math.round(totalMinutes);
-  const hours = Math.floor(rounded / 60);
-  const mins = rounded % 60;
-  return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}`;
-}
-
 export function formatDurationMins(minutes: number | null): string {
   if (minutes === null || !Number.isFinite(minutes)) {
     return 'Not evaluated';

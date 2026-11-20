@@ -9,7 +9,7 @@ interface ImpactDetailsPanelProps {
 
 type DetailTab = 'connections' | 'crews' | 'passengers';
 
-export const ImpactDetailsPanel: React.FC<ImpactDetailsPanelProps> = ({ simulation }) => {
+export const ImpactDetailsPanel: React.FC<ImpactDetailsPanelProps> = React.memo(({ simulation }) => {
   const [activeTab, setActiveTab] = useState<DetailTab>('connections');
   const [onlyDisruptedCx, setOnlyDisruptedCx] = useState(false);
 
@@ -306,4 +306,4 @@ export const ImpactDetailsPanel: React.FC<ImpactDetailsPanelProps> = ({ simulati
       </div>
     </div>
   );
-};
+});

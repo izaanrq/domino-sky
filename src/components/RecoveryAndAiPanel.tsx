@@ -26,7 +26,7 @@ interface RecoveryAndAiPanelProps {
   onRequestAiDispatch: () => void;
 }
 
-export const RecoveryAndAiPanel: React.FC<RecoveryAndAiPanelProps> = ({
+export const RecoveryAndAiPanel: React.FC<RecoveryAndAiPanelProps> = React.memo(({
   originalSimulation,
   rankedFeasible,
   infeasible,
@@ -457,4 +457,4 @@ export const RecoveryAndAiPanel: React.FC<RecoveryAndAiPanelProps> = ({
       </div>
     </section>
   );
-};
+});

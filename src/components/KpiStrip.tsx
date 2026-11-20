@@ -7,7 +7,7 @@ interface KpiStripProps {
   activeLabel?: string;
 }
 
-export const KpiStrip: React.FC<KpiStripProps> = ({ metrics, activeLabel }) => {
+export const KpiStrip: React.FC<KpiStripProps> = React.memo(({ metrics, activeLabel }) => {
   const items = [
     {
       label: 'Delayed Flights',
@@ -107,4 +107,4 @@ export const KpiStrip: React.FC<KpiStripProps> = ({ metrics, activeLabel }) => {
       </div>
     </section>
   );
-};
+});

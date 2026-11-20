@@ -10,7 +10,7 @@ interface FlightImpactTableProps {
 
 type StatusFilter = 'ALL' | 'AFFECTED' | 'DELAYED' | 'CANCELLED' | 'ON_TIME';
 
-export const FlightImpactTable: React.FC<FlightImpactTableProps> = ({
+export const FlightImpactTable: React.FC<FlightImpactTableProps> = React.memo(({
   flights,
   highlightedFlightId,
 }) => {
@@ -276,4 +276,4 @@ export const FlightImpactTable: React.FC<FlightImpactTableProps> = ({
       </div>
     </section>
   );
-};
+});

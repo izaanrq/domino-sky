@@ -10,30 +10,45 @@ const __dirname = path.dirname(__filename);
 const PORT = 3000;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_REQUESTS = 5;
+const MAX_RATE_LIMIT_ENTRIES = 500;
+const GEMINI_TIMEOUT_MS = 20_000;
 
 const requestLogByIp = new Map<string, number[]>();
 
-function getClientIp(req: express.Request): string {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string' && forwarded.trim().length > 0) {
-    return forwarded.split(',')[0].trim();
-  }
-  return req.ip || req.socket.remoteAddress || 'unknown';
+export function getClientIp(req: Pick<express.Request, 'ip' | 'socket'>): string {
+  // Never trust arbitrary client-supplied headers (e.g. X-Forwarded-For) for rate limiting.
+  return req.socket?.remoteAddress || req.ip || 'unknown';
 }
 
-function isRateLimited(ip: string, now: number): { limited: boolean; retryAfterSec: number } {
+export function isRateLimited(
+  ip: string,
+  now: number,
+  store: Map<string, number[]> = requestLogByIp
+): { limited: boolean; retryAfterSec: number } {
   const cutoff = now - RATE_LIMIT_WINDOW_MS;
-  const timestamps = (requestLogByIp.get(ip) ?? []).filter((ts) => ts > cutoff);
+
+  if (store.size > MAX_RATE_LIMIT_ENTRIES) {
+    for (const [key, times] of store.entries()) {
+      const recent = times.filter((ts) => ts > cutoff);
+      if (recent.length === 0) {
+        store.delete(key);
+      } else {
+        store.set(key, recent);
+      }
+    }
+  }
+
+  const timestamps = (store.get(ip) ?? []).filter((ts) => ts > cutoff);
 
   if (timestamps.length >= RATE_LIMIT_MAX_REQUESTS) {
     const oldest = timestamps[0];
     const retryAfterSec = Math.max(1, Math.ceil((oldest + RATE_LIMIT_WINDOW_MS - now) / 1000));
-    requestLogByIp.set(ip, timestamps);
+    store.set(ip, timestamps);
     return { limited: true, retryAfterSec };
   }
 
   timestamps.push(now);
-  requestLogByIp.set(ip, timestamps);
+  store.set(ip, timestamps);
   return { limited: false, retryAfterSec: 0 };
 }
 
@@ -97,13 +112,20 @@ interface DispatchRequestBody {
   candidates: CandidatePayload[];
 }
 
+function isPlainObject(val: unknown): val is Record<string, unknown> {
+  return Boolean(val) && typeof val === 'object' && !Array.isArray(val);
+}
+
 function isNonEmptyString(val: unknown, maxLen: number): val is string {
   return typeof val === 'string' && val.trim().length > 0 && val.length <= maxLen;
 }
 
+function isNonNegativeFinite(val: unknown): val is number {
+  return typeof val === 'number' && Number.isFinite(val) && val >= 0;
+}
+
 function isValidMetrics(m: unknown): m is MetricsPayload {
-  if (!m || typeof m !== 'object') return false;
-  const obj = m as Record<string, unknown>;
+  if (!isPlainObject(m)) return false;
   const keys: (keyof MetricsPayload)[] = [
     'delayedFlights',
     'cancelledFlights',
@@ -115,21 +137,19 @@ function isValidMetrics(m: unknown): m is MetricsPayload {
     'crewDutyViolations',
     'totalCrewDutyOverageMinutes',
   ];
-  return keys.every(
-    (k) => typeof obj[k] === 'number' && Number.isFinite(obj[k]) && (obj[k] as number) >= 0
-  );
+  return keys.every((k) => isNonNegativeFinite(m[k]));
 }
 
-function validateDispatchPayload(raw: unknown): { ok: true; data: DispatchRequestBody } | { ok: false; error: string } {
-  if (!raw || typeof raw !== 'object') {
+export function validateDispatchPayload(
+  raw: unknown
+): { ok: true; data: DispatchRequestBody } | { ok: false; error: string } {
+  if (!isPlainObject(raw)) {
     return { ok: false, error: 'Request body must be a JSON object.' };
   }
-  const body = raw as Record<string, unknown>;
-  const scenario = body.scenario as Record<string, unknown> | undefined;
+  const scenario = raw.scenario;
 
   if (
-    !scenario ||
-    typeof scenario !== 'object' ||
+    !isPlainObject(scenario) ||
     !isNonEmptyString(scenario.airport, 12) ||
     !isNonEmptyString(scenario.airportName, 160) ||
     !isNonEmptyString(scenario.closureStart, 24) ||
@@ -142,59 +162,80 @@ function validateDispatchPayload(raw: unknown): { ok: true; data: DispatchReques
     return { ok: false, error: 'Invalid or incomplete scenario parameters.' };
   }
 
-  if (!isValidMetrics(body.baselineMetrics)) {
+  if (!isValidMetrics(raw.baselineMetrics)) {
     return { ok: false, error: 'Invalid baselineMetrics payload.' };
   }
 
-  if (!Array.isArray(body.affectedFlights) || body.affectedFlights.length > 100) {
+  if (!Array.isArray(raw.affectedFlights) || raw.affectedFlights.length > 100) {
     return { ok: false, error: 'affectedFlights must be an array of at most 100 items.' };
   }
-  for (const fl of body.affectedFlights) {
+  for (const fl of raw.affectedFlights) {
     if (
-      !fl ||
-      typeof fl !== 'object' ||
-      !isNonEmptyString((fl as Record<string, unknown>).flightId, 24) ||
-      !isNonEmptyString((fl as Record<string, unknown>).tailId, 24) ||
-      !isNonEmptyString((fl as Record<string, unknown>).origin, 12) ||
-      !isNonEmptyString((fl as Record<string, unknown>).destination, 12) ||
-      !isNonEmptyString((fl as Record<string, unknown>).status, 24)
+      !isPlainObject(fl) ||
+      !isNonEmptyString(fl.flightId, 24) ||
+      !isNonEmptyString(fl.tailId, 24) ||
+      !isNonEmptyString(fl.origin, 12) ||
+      !isNonEmptyString(fl.destination, 12) ||
+      !isNonEmptyString(fl.status, 24) ||
+      !isNonNegativeFinite(fl.delayMinutes) ||
+      typeof fl.explanation !== 'string' ||
+      fl.explanation.length > 500
     ) {
       return { ok: false, error: 'Invalid entry in affectedFlights.' };
     }
   }
 
-  if (!Array.isArray(body.disruptedConnections) || body.disruptedConnections.length > 50) {
+  if (!Array.isArray(raw.disruptedConnections) || raw.disruptedConnections.length > 50) {
     return { ok: false, error: 'disruptedConnections must be an array of at most 50 items.' };
   }
-  for (const cx of body.disruptedConnections) {
+  for (const cx of raw.disruptedConnections) {
     if (
-      !cx ||
-      typeof cx !== 'object' ||
-      !isNonEmptyString((cx as Record<string, unknown>).connectionId, 24) ||
-      !isNonEmptyString((cx as Record<string, unknown>).airport, 12) ||
-      !isNonEmptyString((cx as Record<string, unknown>).fromFlightId, 24) ||
-      !isNonEmptyString((cx as Record<string, unknown>).toFlightId, 24)
+      !isPlainObject(cx) ||
+      !isNonEmptyString(cx.connectionId, 24) ||
+      !isNonEmptyString(cx.airport, 12) ||
+      !isNonEmptyString(cx.fromFlightId, 24) ||
+      !isNonEmptyString(cx.toFlightId, 24) ||
+      !isNonNegativeFinite(cx.passengers) ||
+      typeof cx.explanation !== 'string' ||
+      cx.explanation.length > 500
     ) {
       return { ok: false, error: 'Invalid entry in disruptedConnections.' };
     }
   }
 
-  if (!Array.isArray(body.crewIssues) || body.crewIssues.length > 50) {
+  if (!Array.isArray(raw.crewIssues) || raw.crewIssues.length > 50) {
     return { ok: false, error: 'crewIssues must be an array of at most 50 items.' };
   }
+  for (const cr of raw.crewIssues) {
+    if (
+      !isPlainObject(cr) ||
+      !isNonEmptyString(cr.crewId, 24) ||
+      !isNonEmptyString(cr.tailId, 24) ||
+      (cr.dutyMinutes !== null && !isNonNegativeFinite(cr.dutyMinutes)) ||
+      typeof cr.maxDutyMinutes !== 'number' ||
+      !Number.isFinite(cr.maxDutyMinutes) ||
+      cr.maxDutyMinutes <= 0 ||
+      !isNonNegativeFinite(cr.overageMinutes) ||
+      typeof cr.violation !== 'boolean'
+    ) {
+      return { ok: false, error: 'Invalid entry in crewIssues.' };
+    }
+  }
 
-  if (!Array.isArray(body.candidates) || body.candidates.length === 0 || body.candidates.length > 100) {
+  if (!Array.isArray(raw.candidates) || raw.candidates.length === 0 || raw.candidates.length > 100) {
     return { ok: false, error: 'candidates must be a non-empty array of at most 100 items.' };
   }
-  for (const c of body.candidates) {
-    if (!c || typeof c !== 'object') {
+  for (const cand of raw.candidates) {
+    if (!isPlainObject(cand)) {
       return { ok: false, error: 'Invalid entry in candidates.' };
     }
-    const cand = c as Record<string, unknown>;
     if (
       !isNonEmptyString(cand.id, 64) ||
       !isNonEmptyString(cand.label, 160) ||
-      typeof cand.feasible !== 'boolean'
+      !isNonEmptyString(cand.actionType, 40) ||
+      typeof cand.feasible !== 'boolean' ||
+      typeof cand.improvesOverBaseline !== 'boolean' ||
+      (cand.rank !== null && (!Number.isInteger(cand.rank) || (cand.rank as number) < 1))
     ) {
       return { ok: false, error: 'Invalid candidate metadata.' };
     }
@@ -203,7 +244,7 @@ function validateDispatchPayload(raw: unknown): { ok: true; data: DispatchReques
     }
   }
 
-  return { ok: true, data: body as unknown as DispatchRequestBody };
+  return { ok: true, data: raw as unknown as DispatchRequestBody };
 }
 
 function getGeminiClient(): GoogleGenAI | null {
@@ -214,6 +255,7 @@ function getGeminiClient(): GoogleGenAI | null {
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
+      timeout: GEMINI_TIMEOUT_MS,
       headers: {
         'User-Agent': 'aistudio-build',
       },
@@ -221,14 +263,69 @@ function getGeminiClient(): GoogleGenAI | null {
   });
 }
 
-async function createApp() {
+function isTimeoutError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const name = 'name' in err ? String((err as { name: unknown }).name) : '';
+  return name === 'TimeoutError' || name === 'AbortError';
+}
+
+export async function createApp() {
   const app = express();
-  app.use(express.json({ limit: '64kb' }));
+  app.disable('x-powered-by');
+  app.set('trust proxy', false);
+
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    next();
+  });
+
+  app.use('/api', express.json({ limit: '64kb' }));
+  app.use(
+    '/api',
+    (
+      err: unknown,
+      _req: express.Request,
+      res: express.Response,
+      next: express.NextFunction
+    ) => {
+      if (err && typeof err === 'object' && 'type' in err) {
+        const errType = String((err as { type: unknown }).type);
+        if (errType === 'entity.too.large') {
+          res.status(413).json({
+            available: false,
+            error: 'Request payload exceeds the 64 KB limit.',
+          });
+          return;
+        }
+        if (errType === 'entity.parse.failed') {
+          res.status(400).json({
+            available: false,
+            error: 'Invalid JSON request body.',
+          });
+          return;
+        }
+      }
+      if (err instanceof SyntaxError) {
+        res.status(400).json({
+          available: false,
+          error: 'Invalid JSON request body.',
+        });
+        return;
+      }
+      next(err);
+    }
+  );
 
   app.get('/api/health', (_req, res) => {
     const apiKey = process.env.GEMINI_API_KEY?.trim();
     const aiConfigured = Boolean(apiKey && apiKey !== 'MY_GEMINI_API_KEY');
     res.json({ ok: true, aiConfigured });
+  });
+
+  app.all('/api/health', (_req, res) => {
+    res.setHeader('Allow', 'GET');
+    res.status(405).json({ ok: false, error: 'Method not allowed.' });
   });
 
   app.post('/api/ai-dispatch', async (req, res) => {
@@ -322,6 +419,7 @@ async function createApp() {
         model: 'gemini-4-hydrogen',
         contents: `Analyze this deterministic airport closure scenario qualitatively and recommend one feasible candidate from evaluatedFeasibleCandidates without citing numerical passenger counts, delay minutes, duty durations, or numerical recovery claims:\n\n${JSON.stringify(promptPayload)}`,
         config: {
+          abortSignal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
           systemInstruction,
           responseMimeType: 'application/json',
           responseSchema: {
@@ -379,34 +477,36 @@ async function createApp() {
         return;
       }
 
-      const parsed = JSON.parse(rawText) as {
-        recommendedCandidateId: string;
-        disruptionSummary: string;
-        rotationPropagationExplanation: string;
-        passengerAndCrewConsequences: string;
-        recommendationRationale: string;
-        tradeOffs: string;
-      };
+      const parsed = JSON.parse(rawText) as unknown;
+      if (!isPlainObject(parsed)) {
+        res.status(502).json({
+          available: false,
+          error:
+            'AI dispatcher returned an invalid response structure. Deterministic recovery rankings remain active.',
+        });
+        return;
+      }
 
-      const matchedCandidate = body.candidates.find(
-        (c) => c.id === parsed.recommendedCandidateId
-      );
-      const isValidAndFeasible = Boolean(matchedCandidate && matchedCandidate.feasible);
+      const recommendedId =
+        typeof parsed.recommendedCandidateId === 'string' ? parsed.recommendedCandidateId : '';
+      const matchedCandidate = feasibleCandidates.find((c) => c.id === recommendedId);
+      const isValidAndFeasible = Boolean(matchedCandidate);
+
+      const safeSummary = String(parsed.disruptionSummary ?? '').slice(0, 600);
+      const safePropagation = String(parsed.rotationPropagationExplanation ?? '').slice(0, 600);
+      const safePaxCrew = String(parsed.passengerAndCrewConsequences ?? '').slice(0, 600);
+      const safeRationale = String(parsed.recommendationRationale ?? '').slice(0, 600);
+      const safeTradeOffs = String(parsed.tradeOffs ?? '').slice(0, 600);
 
       if (!isValidAndFeasible) {
         res.json({
           available: true,
           recommendedCandidateId: null,
-          disruptionSummary: String(parsed.disruptionSummary ?? '').slice(0, 600),
-          rotationPropagationExplanation: String(
-            parsed.rotationPropagationExplanation ?? ''
-          ).slice(0, 600),
-          passengerAndCrewConsequences: String(parsed.passengerAndCrewConsequences ?? '').slice(
-            0,
-            600
-          ),
-          recommendationRationale: String(parsed.recommendationRationale ?? '').slice(0, 600),
-          tradeOffs: String(parsed.tradeOffs ?? '').slice(0, 600),
+          disruptionSummary: safeSummary,
+          rotationPropagationExplanation: safePropagation,
+          passengerAndCrewConsequences: safePaxCrew,
+          recommendationRationale: safeRationale,
+          tradeOffs: safeTradeOffs,
           validatedFeasible: false,
           validationMessage:
             'AI response did not reference a valid feasible candidate ID from the deterministic engine. Refer to the deterministic ranking table.',
@@ -416,33 +516,40 @@ async function createApp() {
 
       res.json({
         available: true,
-        recommendedCandidateId: parsed.recommendedCandidateId,
-        disruptionSummary: String(parsed.disruptionSummary ?? '').slice(0, 600),
-        rotationPropagationExplanation: String(
-          parsed.rotationPropagationExplanation ?? ''
-        ).slice(0, 600),
-        passengerAndCrewConsequences: String(parsed.passengerAndCrewConsequences ?? '').slice(
-          0,
-          600
-        ),
-        recommendationRationale: String(parsed.recommendationRationale ?? '').slice(0, 600),
-        tradeOffs: String(parsed.tradeOffs ?? '').slice(0, 600),
+        recommendedCandidateId: recommendedId,
+        disruptionSummary: safeSummary,
+        rotationPropagationExplanation: safePropagation,
+        passengerAndCrewConsequences: safePaxCrew,
+        recommendationRationale: safeRationale,
+        tradeOffs: safeTradeOffs,
         validatedFeasible: true,
-        validationMessage: `Verified against deterministic engine: ${parsed.recommendedCandidateId} (Rank #${matchedCandidate?.rank ?? '—'}).`,
+        validationMessage: `Verified against deterministic engine: ${recommendedId} (Rank #${matchedCandidate?.rank ?? '—'}).`,
       });
     } catch (err: unknown) {
-      // Log sanitized error server-side only; never expose stack traces or provider internals to the client
-      const safeCode =
-        err && typeof err === 'object' && 'status' in err
+      // Log sanitized error code server-side only; never expose stack traces or credentials
+      const timedOut = isTimeoutError(err);
+      const safeCode = timedOut
+        ? 'timeout'
+        : err && typeof err === 'object' && 'status' in err
           ? String((err as { status: unknown }).status)
           : 'upstream_error';
       console.error(`[ai-dispatch] Gemini request failed (${safeCode}).`);
-      res.status(502).json({
+      res.status(timedOut ? 504 : 502).json({
         available: false,
-        error:
-          'AI dispatcher service is temporarily unavailable. Deterministic recovery rankings remain active.',
+        error: timedOut
+          ? 'AI dispatcher request timed out. Deterministic recovery rankings remain active.'
+          : 'AI dispatcher service is temporarily unavailable. Deterministic recovery rankings remain active.',
       });
     }
+  });
+
+  app.all('/api/ai-dispatch', (_req, res) => {
+    res.setHeader('Allow', 'POST');
+    res.status(405).json({ available: false, error: 'Method not allowed.' });
+  });
+
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ available: false, error: 'API endpoint not found.' });
   });
 
   if (process.env.NODE_ENV === 'production') {
@@ -460,9 +567,16 @@ async function createApp() {
     app.use(vite.middlewares);
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Domino Sky server listening on http://0.0.0.0:${PORT}`);
-  });
+  return app;
 }
 
-createApp();
+const isMainModule =
+  Boolean(process.argv[1]) && path.resolve(process.argv[1]) === __filename;
+
+if (isMainModule) {
+  createApp().then((app) => {
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Domino Sky server listening on http://0.0.0.0:${PORT}`);
+    });
+  });
+}

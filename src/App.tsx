@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Play, RotateCcw, ShieldCheck } from 'lucide-react';
 import { CascadeTimeline } from './components/CascadeTimeline';
 import { FlightImpactTable } from './components/FlightImpactTable';
@@ -41,6 +41,13 @@ export default function App() {
   // AI Dispatcher state
   const [aiRecommendation, setAiRecommendation] = useState<AIDispatchRecommendation | null>(null);
   const [aiLoading, setAiLoading] = useState<boolean>(false);
+  const aiAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    return () => {
+      aiAbortRef.current?.abort();
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -80,17 +87,12 @@ export default function App() {
     return evaluateRecoveryOptions(dataset, activeClosure, originalSimulation);
   }, [dataset, activeClosure, originalSimulation]);
 
-  // Keep selectedCandidateId valid when scenario changes
+  // Auto-select top ranked feasible candidate whenever scenario evaluation changes
   useEffect(() => {
     if (!recoveryEvaluation) return;
-    const exists = recoveryEvaluation.rankedFeasible.some(
-      (c) => c.id === selectedCandidateId
-    );
-    if (!exists) {
-      const top = recoveryEvaluation.rankedFeasible[0];
-      setSelectedCandidateId(top ? top.id : 'DO_NOTHING');
-    }
-  }, [recoveryEvaluation, selectedCandidateId]);
+    const top = recoveryEvaluation.rankedFeasible[0];
+    setSelectedCandidateId(top ? top.id : 'DO_NOTHING');
+  }, [recoveryEvaluation]);
 
   const selectedCandidate = useMemo(() => {
     if (!recoveryEvaluation) return null;
@@ -117,6 +119,8 @@ export default function App() {
           setFormError('Closure duration must be between 5 and 720 minutes.');
           return;
         }
+        aiAbortRef.current?.abort();
+        setAiLoading(false);
         setFormError(null);
         setSelectedAirport(airport);
         setClosureStartStr(startStr);
@@ -128,24 +132,11 @@ export default function App() {
         });
         setAiRecommendation(null);
         setViewLens('ORIGINAL');
-
-        // Auto-pick best ranked feasible candidate for comparison if dataset ready
-        if (dataset) {
-          const closureObj: AirportClosure = {
-            airport,
-            startMinutes: startMins,
-            durationMinutes: Math.round(duration),
-          };
-          const orig = runSimulation(dataset, closureObj);
-          const rec = evaluateRecoveryOptions(dataset, closureObj, orig);
-          const best = rec.rankedFeasible[0];
-          setSelectedCandidateId(best ? best.id : 'DO_NOTHING');
-        }
       } catch (err: unknown) {
         setFormError(err instanceof Error ? err.message : 'Invalid closure parameters.');
       }
     },
-    [dataset]
+    []
   );
 
   const handleRunSimulation = (e: React.FormEvent) => {
@@ -153,26 +144,37 @@ export default function App() {
     executeScenario(selectedAirport, closureStartStr, durationMinutes);
   };
 
-  const handleReset = () => {
+  const handleReset = useCallback(() => {
+    aiAbortRef.current?.abort();
+    setAiLoading(false);
     setActiveClosure(null);
     setFormError(null);
     setSelectedCandidateId('DO_NOTHING');
     setViewLens('ORIGINAL');
     setHighlightedFlightId(null);
     setAiRecommendation(null);
-  };
+  }, []);
 
-  const handleSelectCandidate = (candidateId: string) => {
+  const handleSelectCandidate = useCallback((candidateId: string) => {
     setSelectedCandidateId(candidateId);
     if (candidateId !== 'DO_NOTHING') {
       setViewLens('RECOVERY');
     } else {
       setViewLens('ORIGINAL');
     }
-  };
+  }, []);
 
-  const handleRequestAiDispatch = async () => {
+  const handleInspectFlight = useCallback((fid: string) => {
+    setHighlightedFlightId(fid);
+    document.getElementById('flights')?.scrollIntoView({ behavior: 'smooth' });
+  }, []);
+
+  const handleRequestAiDispatch = useCallback(async () => {
     if (!dataset || !originalSimulation || !recoveryEvaluation || !activeClosure) return;
+
+    aiAbortRef.current?.abort();
+    const controller = new AbortController();
+    aiAbortRef.current = controller;
 
     setAiLoading(true);
     setAiRecommendation(null);
@@ -233,30 +235,45 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
+        signal: controller.signal,
       });
 
+      const contentType = res.headers.get('content-type') ?? '';
+      if (!contentType.includes('application/json')) {
+        throw new Error(`Unexpected server response (${res.status}).`);
+      }
+
       const data = (await res.json()) as AIDispatchRecommendation;
-      setAiRecommendation(data);
+      if (!controller.signal.aborted) {
+        setAiRecommendation(data);
+      }
     } catch (err: unknown) {
-      setAiRecommendation({
-        available: false,
-        recommendedCandidateId: null,
-        disruptionSummary: '',
-        rotationPropagationExplanation: '',
-        passengerAndCrewConsequences: '',
-        recommendationRationale: '',
-        tradeOffs: '',
-        validatedFeasible: false,
-        validationMessage: null,
-        error:
-          err instanceof Error
-            ? `Failed to contact AI dispatcher: ${err.message}`
-            : 'Failed to contact AI dispatcher.',
-      });
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        return;
+      }
+      if (!controller.signal.aborted) {
+        setAiRecommendation({
+          available: false,
+          recommendedCandidateId: null,
+          disruptionSummary: '',
+          rotationPropagationExplanation: '',
+          passengerAndCrewConsequences: '',
+          recommendationRationale: '',
+          tradeOffs: '',
+          validatedFeasible: false,
+          validationMessage: null,
+          error:
+            err instanceof Error
+              ? `Failed to contact AI dispatcher: ${err.message}`
+              : 'Failed to contact AI dispatcher.',
+        });
+      }
     } finally {
-      setAiLoading(false);
+      if (!controller.signal.aborted) {
+        setAiLoading(false);
+      }
     }
-  };
+  }, [dataset, originalSimulation, recoveryEvaluation, activeClosure]);
 
   if (loadError) {
     return (
@@ -575,7 +592,7 @@ export default function App() {
               flights={activeDisplaySimulation.flights}
               closure={activeDisplaySimulation.closure}
               selectedAirportId={selectedAirport}
-              onSelectAirport={(id) => setSelectedAirport(id)}
+              onSelectAirport={setSelectedAirport}
               titleSuffix={
                 viewLens === 'RECOVERY' && selectedCandidate?.id !== 'DO_NOTHING'
                   ? 'Recovery View'
@@ -606,10 +623,7 @@ export default function App() {
         <CascadeTimeline
           flights={activeDisplaySimulation.flights}
           closure={activeDisplaySimulation.closure}
-          onInspectFlight={(fid) => {
-            setHighlightedFlightId(fid);
-            document.getElementById('flights')?.scrollIntoView({ behavior: 'smooth' });
-          }}
+          onInspectFlight={handleInspectFlight}
         />
 
         {/* Flight Impact Table */}

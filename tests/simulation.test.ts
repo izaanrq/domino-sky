@@ -10,6 +10,7 @@ import {
 } from '../src/engine/recovery';
 import { runSimulation } from '../src/engine/simulator';
 import { formatMinutes, parseHHMM } from '../src/engine/time';
+import { getClientIp, isRateLimited, validateDispatchPayload } from '../server';
 
 const rawJson = JSON.parse(
   fs.readFileSync(
@@ -423,4 +424,94 @@ test('12. Regression: AMD 06:20-07:30 recovery ranking prioritizes avoiding canc
   assert.equal(cancelDs1201.metrics.passengersOnCancelledFlights, expectedCancelledPax);
   assert.ok(cancelDs1201.metrics.passengersOnCancelledFlights > 0);
 });
+
+test('13. Security: rate limiter ignores spoofed X-Forwarded-For and validator rejects malformed payloads', () => {
+  const spoofedReq = {
+    ip: '10.9.9.9',
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { 'x-forwarded-for': '203.0.113.55' },
+  } as unknown as Parameters<typeof getClientIp>[0];
+
+  const resolvedIp = getClientIp(spoofedReq);
+  assert.equal(resolvedIp, '127.0.0.1');
+
+  const store = new Map<string, number[]>();
+  const t0 = 1_700_000_000_000;
+  for (let i = 0; i < 5; i++) {
+    assert.equal(isRateLimited(resolvedIp, t0 + i * 1000, store).limited, false);
+  }
+  const sixth = isRateLimited(resolvedIp, t0 + 6000, store);
+  assert.equal(sixth.limited, true);
+  assert.ok(sixth.retryAfterSec >= 1);
+
+  assert.equal(validateDispatchPayload(null).ok, false);
+  assert.equal(validateDispatchPayload([]).ok, false);
+
+  const closure = {
+    airport: 'AMD',
+    startMinutes: parseHHMM('06:20'),
+    durationMinutes: 70,
+  };
+  const sim = runSimulation(dataset, closure);
+  const { rankedFeasible } = evaluateRecoveryOptions(dataset, closure, sim);
+
+  const validPayload = {
+    scenario: {
+      airport: 'AMD',
+      airportName: 'Ahmedabad (Sardar Vallabhbhai Patel International)',
+      closureStart: '06:20',
+      closureEnd: '07:30',
+      durationMinutes: 70,
+    },
+    baselineMetrics: sim.summary,
+    affectedFlights: sim.flights
+      .filter((f) => f.status !== 'ON_TIME')
+      .map((f) => ({
+        flightId: f.flightId,
+        tailId: f.originalTailId,
+        origin: f.origin,
+        destination: f.destination,
+        delayMinutes: f.delayMinutes,
+        status: f.status,
+        explanation: f.explanation,
+      })),
+    disruptedConnections: sim.connections
+      .filter((c) => c.disrupted)
+      .map((c) => ({
+        connectionId: c.connectionId,
+        airport: c.airport,
+        fromFlightId: c.fromFlightId,
+        toFlightId: c.toFlightId,
+        passengers: c.passengers,
+        explanation: c.explanation,
+      })),
+    crewIssues: sim.crews.map((cr) => ({
+      crewId: cr.crewId,
+      tailId: cr.tailId,
+      dutyMinutes: cr.dutyMinutes,
+      maxDutyMinutes: cr.maxDutyMinutes,
+      overageMinutes: cr.overageMinutes,
+      violation: cr.violation,
+    })),
+    candidates: rankedFeasible.map((c) => ({
+      id: c.id,
+      label: c.label,
+      actionType: c.action.type,
+      feasible: c.feasible,
+      infeasibilityReason: c.infeasibilityReason,
+      rank: c.rank,
+      improvesOverBaseline: c.improvesOverBaseline,
+      metrics: c.metrics,
+    })),
+  };
+
+  assert.equal(validateDispatchPayload(validPayload).ok, true);
+
+  const badCrewPayload = {
+    ...validPayload,
+    crewIssues: [{ crewId: 'CR01', tailId: 'VT-DS01', violation: 'invalid' }],
+  };
+  assert.equal(validateDispatchPayload(badCrewPayload).ok, false);
+});
+
 

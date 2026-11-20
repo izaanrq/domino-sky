@@ -11,7 +11,7 @@ interface CascadeTimelineProps {
 const DAY_START = 5 * 60; // 05:00 IST
 const DEFAULT_DAY_END = 23 * 60; // 23:00 IST
 
-export const CascadeTimeline: React.FC<CascadeTimelineProps> = ({
+export const CascadeTimeline: React.FC<CascadeTimelineProps> = React.memo(({
   flights,
   closure,
   onInspectFlight,
@@ -274,4 +274,4 @@ export const CascadeTimeline: React.FC<CascadeTimelineProps> = ({
       </div>
     </section>
   );
-};
+});

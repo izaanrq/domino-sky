@@ -52,7 +52,7 @@ interface AggregatedRoute {
   flightIds: string[];
 }
 
-export const NetworkMapSvg: React.FC<NetworkMapSvgProps> = ({
+export const NetworkMapSvg: React.FC<NetworkMapSvgProps> = React.memo(({
   airports,
   flights,
   closure,
@@ -621,4 +621,4 @@ export const NetworkMapSvg: React.FC<NetworkMapSvgProps> = ({
       </div>
     </div>
   );
-};
+});
